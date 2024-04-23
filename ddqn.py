@@ -1,48 +1,43 @@
 import flappy_bird_gymnasium
 import gymnasium as gym
 import numpy as np
-import sys
 import random
 from collections import deque
 import cv2
-# from google.colab import files
-
-import matplotlib.pyplot as plt
-from keras.src.initializers import HeUniform, Zeros, Constant
-from keras.src.layers import BatchNormalization
+import os
+from glob import glob
+from datetime import datetime
 
 from tensorflow import keras
 from tensorflow.keras import layers
+from keras.initializers import HeUniform, Zeros, Constant
+from keras.layers import BatchNormalization
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import BinaryCrossentropy
 from tensorflow.keras.losses import MeanSquaredError
-from tensorflow.keras.initializers import RandomUniform
+import matplotlib.pyplot as plt
 
 FLAPPY_ENV = gym.make("FlappyBird-v0", render_mode="rgb_array", use_lidar=False, background=None)
-SEED = 42
-FLAPPY_ENV.action_space.seed(SEED)
-FLAPPY_ENV.observation_space.seed(SEED)
-np.random.seed(SEED)
-random.seed(SEED)
+FLAPPY_ENV.reset()
 
-FLAPPY_ENV.reset(seed=SEED)
-REDUCTION_PERCENTAGE = 25
+BATCH_SIZE = 32
+TOTAL_STEPS = 500000
+OBSERVE_STEPS = 100000
+REPLAY_BUFFER_SIZE = 100000
+NUM_STEPS = 1
+REPLAY_FREQUENCY = 30
+TARGET_MODEL_UPDATE_FREQ = 30
+GAMMA = 0.99
+
+REDUCTION_PERCENTAGE = 50
 original_height, original_width, channels = FLAPPY_ENV.render().shape
 ASPECT_RATIO = original_width / original_height
 TARGET_WIDTH = int(original_width * (1 - REDUCTION_PERCENTAGE / 100))
 TARGET_HEIGHT = int(TARGET_WIDTH / ASPECT_RATIO)
 
-BATCH_SIZE = 32
-NUM_STEPS = 10
-NUM_EPISODES = 1000
-TARGET_MODEL_UPDATE = 5
-MAX_STEPS_EPISODE = 500
-REPLAY_BUFFER_SIZE = 100000
-
-GAMMA_START = 0.95
-GAMMA_FINAL = 0.5
-GAMMA_STEP = 0.01
-THRESHOLD = 10
+episode_rewards = []
+loss_values = []
+epsilon_values = []
+episode_lengths = []
 
 
 def process_image(image):
@@ -52,61 +47,87 @@ def process_image(image):
     return normalized_image
 
 
-def create_nn(action_size):
-    image_input = layers.Input(shape=(TARGET_HEIGHT, TARGET_WIDTH, 1), name='image_input')
+def create_nn(action_size, stack_size):
+    image_input = layers.Input(shape=(stack_size, TARGET_HEIGHT, TARGET_WIDTH), name='image_input')
+    action_input = layers.Input(shape=(stack_size - 1,), name='action_input')
+
     x = layers.Conv2D(filters=32, kernel_size=8, strides=4, padding='same', kernel_initializer=HeUniform(),
                       bias_initializer=Zeros())(image_input)
     x = BatchNormalization()(x)
     x = layers.Activation('relu')(x)
-    x = layers.MaxPooling2D(pool_size=2)(x)
+    x = layers.MaxPooling2D(pool_size=2, padding='same')(x)
 
     x = layers.Conv2D(filters=64, kernel_size=4, strides=2, padding='same', kernel_initializer=HeUniform(),
                       bias_initializer=Zeros())(x)
     x = BatchNormalization()(x)
     x = layers.Activation('relu')(x)
-    x = layers.MaxPooling2D(pool_size=2)(x)
+    x = layers.MaxPooling2D(pool_size=2, padding='same')(x)
+
+    x = layers.Conv2D(filters=64, kernel_size=3, strides=1, padding='same', kernel_initializer=HeUniform(),
+                      bias_initializer=Zeros())(x)
+    x = BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.MaxPooling2D(pool_size=2, padding='same')(x)
 
     x = layers.Flatten()(x)
 
-    x = layers.Dense(64, kernel_initializer=HeUniform(), bias_initializer=Zeros())(x)
-    x = BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(0.20)(x)
+    x = keras.Model(inputs=[image_input], outputs=x)
 
-    x = layers.Dense(64, kernel_initializer=HeUniform(), bias_initializer=Zeros())(x)
-    x = BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(0.20)(x)
-    output = layers.Dense(action_size, activation='linear', kernel_initializer=HeUniform(),
-                          bias_initializer=Constant(0.1))(x)
+    combined = layers.concatenate([x.output, action_input])
 
-    model = keras.Model(inputs=[image_input], outputs=output)
-    model.compile(optimizer=Adam(), loss=MeanSquaredError())
+    combined = layers.Dense(512, kernel_initializer=HeUniform(), bias_initializer=Zeros())(combined)
+    combined = BatchNormalization()(combined)
+    combined = layers.Activation('relu')(combined)
+    combined = layers.Dropout(0.15)(combined)
+
+    combined = layers.Dense(action_size, activation='linear', kernel_initializer=HeUniform(),
+                            bias_initializer=Constant(0.1))(combined)
+
+    model = keras.Model(inputs=[x.input, action_input], outputs=combined)
     return model
 
 
 ACTION_SIZE = FLAPPY_ENV.action_space.n
-POLICY_NETWORK = create_nn(ACTION_SIZE)
-TARGET_NETWORK = create_nn(ACTION_SIZE)
+STACK_SIZE = 4
+POLICY_NETWORK = create_nn(ACTION_SIZE, STACK_SIZE)
+TARGET_NETWORK = create_nn(ACTION_SIZE, STACK_SIZE)
+
+weights_dir = './checkpoints/'
+weights_files = glob(os.path.join(weights_dir, 'flappy_*.weights.h5'))
+weights_files.sort(key=os.path.getmtime, reverse=True)
+
+POLICY_NETWORK.compile(optimizer=Adam(), loss=MeanSquaredError())
+TARGET_NETWORK.compile(optimizer=Adam(), loss=MeanSquaredError())
 TARGET_NETWORK.set_weights(POLICY_NETWORK.get_weights())
 
-EPSILON_START = 1
-EPSILON_FINAL = 0.1
-EPSILON_DECAY_STEPS = 800
+EPSILON = 0.1
+EPSILON_FINAL = 0.0001
+REWARD_TARGET = 10
+STEPS_TO_TAKE = REWARD_TARGET
+REWARD_INCREMENT = 1
+REWARD_THRESHOLD = 0
+EPSILON_DELTA = (EPSILON - EPSILON_FINAL) / STEPS_TO_TAKE
 
 
-def decay_epsilon(episode):
-    slope = (EPSILON_START - EPSILON_FINAL) / EPSILON_DECAY_STEPS
-    epsilon = max(EPSILON_FINAL, EPSILON_START - slope * episode)
-    return epsilon
+def decay_epsilon(step_no, observe_steps, episode_reward):
+    global EPSILON
+    global REWARD_THRESHOLD
+
+    if step_no < observe_steps:
+        return EPSILON
+    if EPSILON > EPSILON_FINAL and episode_reward > REWARD_THRESHOLD:
+        EPSILON = max(EPSILON_FINAL, EPSILON - EPSILON_DELTA)
+        REWARD_THRESHOLD += REWARD_INCREMENT
+    return EPSILON
 
 
-def epsilon_greedy(Q, eps):
-    action_size = Q.shape[0]
-    if random.random() > eps:
-        return np.argmax(Q)
+def epsilon_greedy(state_stack, action_stack):
+    if random.random() > EPSILON:
+        Q = POLICY_NETWORK.predict([state_stack, action_stack], batch_size=1, verbose=0)
+        action = np.argmax(Q)
     else:
-        return random.choice(np.arange(action_size))
+        action = random.choice(np.arange(ACTION_SIZE))
+    return action
 
 
 def sample(buffer, batch_size, num_steps):
@@ -129,11 +150,6 @@ def sample(buffer, batch_size, num_steps):
             rewards_frame.append(reward)
             next_states_frame.append(next_state)
             dones_frame.append(done)
-            if done:
-                break
-
-        if len(states_frame) < num_steps:
-            continue
 
         sample_data.append((states_frame, actions_frame, rewards_frame, next_states_frame, dones_frame))
 
@@ -141,110 +157,162 @@ def sample(buffer, batch_size, num_steps):
 
 
 def replay(policy_network, target_network, replay_buffer, num_steps, gamma, batch_size):
-    if len(replay_buffer) < batch_size + num_steps:
+    if len(replay_buffer) < batch_size + num_steps + STACK_SIZE:
         return
 
     sample_data = sample(replay_buffer, batch_size, num_steps)
 
     state_batch, action_batch, reward_batch, next_state_batch, done_batch = zip(*sample_data)
 
-    # take first state & action from each frame and last state from each frame => batch size array of first states from each frame and last states from each frame
     state_batch_arr = np.array(state_batch)[:, 0]
-    action_batch_arr = np.array(action_batch)[:, 0]
     next_state_batch_arr = np.array(next_state_batch)[:, -1]
+
+    action_batch_arr = np.array(action_batch)[:, 0]
+    sized_action_batch_arr = action_batch_arr[:, :-1]
+
+    next_state_action_batch_arr = np.array(action_batch)[:, -1]
+    next_sized_action_batch_arr = next_state_action_batch_arr[:, 1:]
+
     done_batch_arr = np.array(done_batch)
     reward_batch_arr = np.array(reward_batch)
 
-    Q_policy = policy_network.predict_on_batch(next_state_batch_arr)
-    Q_target = target_network.predict_on_batch(state_batch_arr)
+    Q_policy = policy_network.predict_on_batch([state_batch_arr, sized_action_batch_arr])
+    Q_policy_next = policy_network.predict_on_batch([next_state_batch_arr, next_sized_action_batch_arr])
+    next_policy_actions = np.argmax(Q_policy_next, axis=1)
+    Q_target = target_network.predict_on_batch([next_state_batch_arr, next_sized_action_batch_arr])
 
     for i, reward in enumerate(reward_batch_arr):
         discounts = np.power(gamma, np.arange(len(reward)))
         n_step_return = np.sum(reward * discounts)
-        if not done_batch_arr[i, -1]:
-            next_state_value = np.max(Q_policy[i][0])
-            n_step_return += np.power(gamma, num_steps) * next_state_value
-        Q_target[i, action_batch_arr[i]] = n_step_return
+        if done_batch_arr[i, -1]:
+            estimated_q = Q_target[[i], next_policy_actions[i]]
+            n_step_return += np.power(gamma, num_steps) * estimated_q
+        Q_policy[i, action_batch_arr[:, -1][i]] = n_step_return
 
-    policy_network.train_on_batch(state_batch_arr, Q_target)
+    loss = policy_network.train_on_batch([state_batch_arr, sized_action_batch_arr], Q_policy)
+    loss_values.append(loss)
 
 
-def train(env, policy_network, target_network, num_episodes, batch_size, num_steps, gamma, target_model_update,
-          plot_every=10):
+def train(env, policy_network, target_network, total_steps, observe_steps, num_steps, gamma, batch_size,
+          target_model_update_freq, replay_frequency):
     replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
 
-    tmp_scores = deque(maxlen=plot_every)
-    avg_scores = deque(maxlen=num_episodes // plot_every)
+    total_parameter_updates = 0
+    i_step = 0
+    max_reward = 0
+    max_steps = 0
 
-    total_step = 0
-
-    for i_episode in range(1, num_episodes + 1):
-        epsilon = decay_epsilon(i_episode)
+    while i_step < total_steps:
 
         env.reset()
         state = process_image(env.render())
+        state_stack = deque(maxlen=STACK_SIZE)
+        action_stack = deque(maxlen=STACK_SIZE)
+        state_stack.extend([state] * STACK_SIZE)
+        action_stack.extend([0] * STACK_SIZE)
+
         step = 0
         total_reward = 0
+        action = action_stack[-1]
+        skipped_steps = 4
 
         while True:
-            temp_state = np.expand_dims(state, axis=0)
-            Q = policy_network.predict([temp_state], verbose=0)
-            action = epsilon_greedy(Q[0], epsilon)
+
+            if step % skipped_steps == 0:
+                if i_step < observe_steps:
+                    action = np.random.randint(ACTION_SIZE)
+                else:
+                    actions = np.array([action_stack])
+                    action = epsilon_greedy(np.array([state_stack]), actions[:, 1:])
+
+            action_stack.append(action)
 
             next_state, reward, terminated, truncated, info = env.step(action)
+            if reward == 0.1:
+                reward = 0.001
+
             total_reward += reward
 
             next_state = process_image(env.render())
-            replay_buffer.append((state, action, reward, next_state, terminated or truncated))
+            next_state_stack = state_stack + deque([next_state])
+            replay_buffer.append((state_stack, action_stack, reward, next_state_stack, terminated or truncated))
 
-            replay(policy_network, target_network, replay_buffer, num_steps, gamma, batch_size)
+            if i_step > observe_steps and i_step % replay_frequency == 0:
+                total_parameter_updates += 1
+                replay(policy_network, target_network, replay_buffer, num_steps, gamma, batch_size)
+
+            if total_parameter_updates % target_model_update_freq == 0:
+                target_network.set_weights(policy_network.get_weights())
+
+            step += 1
+            i_step += 1
+            state_stack = next_state_stack
 
             if terminated or truncated:
-                print("Episode ({}/{}) finished after {} timesteps, total reward: {}, gamma: {}, epsilon: {}".format(
-                    i_episode,
-                    num_episodes,
-                    step,
-                    total_reward,
-                    gamma,
-                    epsilon))
-                tmp_scores.append(total_reward)
+                print(
+                    "Episode finished after {} timesteps, total reward: {}, gamma: {}, epsilon: {}, step count: {}".format(
+                        step,
+                        total_reward,
+                        gamma,
+                        EPSILON,
+                        i_step))
+
+                epsilon_values.append(EPSILON)
+                decay_epsilon(i_step, observe_steps, total_reward)
+                episode_rewards.append(total_reward)
+                episode_lengths.append(step)
+                if total_reward > max_reward:
+                    max_reward = total_reward
+                    max_steps = step
+
                 break
 
-            if step > MAX_STEPS_EPISODE:
-                print("Episode OVER finished after {} timesteps".format(step))
-                break
-
-            state = next_state
-            step += 1
-
-        total_step += step
-
-        if i_episode % target_model_update == 0:
-            target_network.set_weights(policy_network.get_weights())
-
-        if i_episode % plot_every == 0:
-            avg_scores.append(np.mean(tmp_scores))
-
-    video_path = "flappy_bird_video.avi"
-    video = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'DIVX'), 1, (TARGET_WIDTH, TARGET_HEIGHT),
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    video_path = f'flappy_bird_{current_date}.avi'
+    video = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'DIVX'), 30, (TARGET_WIDTH, TARGET_HEIGHT),
                             isColor=False)
     for experience in replay_buffer:
         state, action, reward, next_state, done = experience
-        video.write(state)
+        video.write((state[-1] * 255.0).astype(np.uint8))
     video.release()
-    # files.download('flappy_bird_video.avi')
 
-    plt.plot(np.linspace(0, num_episodes, len(avg_scores), endpoint=False), np.asarray(avg_scores))
-    plt.xlabel('Episode Number')
-    plt.ylabel('Average Reward (Over Next %d Episodes)' % plot_every)
-    plt.show()
-    # print best 100-episode performance
-    print(('Best Average Reward over %d Episodes: ' % plot_every), np.max(avg_scores))
+    weights_file_path = f'./checkpoints/flappy_{current_date}.weights.h5'
 
-    print(('Total steps for %d episodes: ' % num_episodes), num_steps)
+    policy_network.save_weights(weights_file_path, overwrite=True)
 
     env.close()
 
+    print('Max reward: ', max_reward, ', max steps: ', max_steps)
 
-train(FLAPPY_ENV, POLICY_NETWORK, TARGET_NETWORK, NUM_EPISODES, BATCH_SIZE, NUM_STEPS, GAMMA_START, TARGET_MODEL_UPDATE,
-      plot_every=10)
+
+train(FLAPPY_ENV, POLICY_NETWORK, TARGET_NETWORK, TOTAL_STEPS, OBSERVE_STEPS, NUM_STEPS, GAMMA, BATCH_SIZE,
+      TARGET_MODEL_UPDATE_FREQ, REPLAY_FREQUENCY)
+
+current_date = datetime.now().strftime('%Y-%m-%d')
+plt.plot(episode_rewards)
+plt.xlabel('Episode')
+plt.ylabel('Total Reward')
+plt.title('Reward over Episodes')
+plt.savefig(f'reward_plot_{current_date}.png')
+plt.show()
+
+plt.plot(epsilon_values)
+plt.xlabel('Training Step')
+plt.ylabel('Epsilon Value')
+plt.title('Epsilon Value over Training Steps')
+plt.savefig(f'epsilon_plot_{current_date}.png')
+plt.show()
+
+plt.plot(episode_lengths)
+plt.xlabel('Episode')
+plt.ylabel('Episode Length')
+plt.title('Episode Length over Episodes')
+plt.savefig(f'episode_length_plot_{current_date}.png')
+plt.show()
+
+plt.plot(loss_values)
+plt.xlabel('Training Step')
+plt.ylabel('Loss')
+plt.title('Training Loss over Steps')
+plt.savefig(f'loss_plot_{current_date}.png')
+plt.show()
